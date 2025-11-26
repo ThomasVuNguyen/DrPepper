@@ -1,2 +1,3 @@
 .venv/
 data/corpus.txt
+__pycache__/

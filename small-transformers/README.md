@@ -21,7 +21,9 @@ pip install tqdm sentencepiece
 ```
 
 ## Repository Layout
-- `train.py`: stream a huge text file, tokenize on the fly, and train a small GPT model (CPU-only).
+- `train_model.py`: stream a huge text file, tokenize on the fly, and train a small GPT model (CPU-only).
+- `config.json`: hyperparameters and paths used by `train_model.py`.
+- `train_tokenizer.py`: utility to train a SentencePiece tokenizer.
 - `generate.py`: load a checkpoint and sample text.
 - `README.md`: this guide.
 
@@ -46,20 +48,20 @@ pip install tqdm sentencepiece
    - Avoid loading the whole file into RAM; rely on streaming + small buffers.
 
 ## Model Configuration (fits in 24GB RAM)
-Example GPT-like config:
+Default config in `config.json` (about 10.6M params):
 - `vocab_size`: 32000
-- `n_layer`: 8
+- `n_layer`: 3
 - `n_head`: 8
-- `d_model`: 512
-- `d_ff`: 2048
-- `block_size`: 256-512
+- `d_model`: 256
+- `d_ff`: 1024
+- `block_size`: 256
 - Dropout: 0.1
 - Weight tying between token embedding and output head to reduce params.
 
-This is roughly ~45M parameters. With AdamW and reasonable batch sizes it runs within 24GB on CPU.
+You can raise `n_layer`, `d_model`, or `d_ff` to scale up (e.g., the previous 8-layer, 512-d model was ~42M params) if memory allows.
 
-## Training Loop (implemented in `train.py`)
-`train.py` provides streaming data loading, a small decoder-only Transformer, gradient accumulation, warmup+cosine LR, gradient clipping, and checkpointing. Configure everything via CLI flags.
+## Training Loop (implemented in `train_model.py`)
+`train_model.py` provides streaming data loading, a small decoder-only Transformer, gradient accumulation, warmup+cosine LR, gradient clipping, and checkpointing. Configure everything via `config.json`.
 
 Key training tips for CPU:
 - Use mixed precision **only if** your CPU supports bfloat16/AVX512; otherwise stay in float32.
@@ -68,18 +70,11 @@ Key training tips for CPU:
 - Warmup LR schedule (e.g., 1k-5k steps) then cosine decay.
 - Checkpoint every N steps to resume easily; store model + optimizer + scheduler states.
 
-Example run command (once `train.py` exists):
+Example run command:
 ```bash
-python train.py \
-  --data data/corpus.txt \
-  --tokenizer tokenizer.model \
-  --vocab-size 32000 \
-  --n-layer 8 --n-head 8 --d-model 512 --d-ff 2048 \
-  --block-size 256 \
-  --batch-size 12 --grad-accum 20 \
-  --lr 3e-4 --warmup-steps 2000 --max-steps 500000 \
-  --checkpoint-dir ckpts/
+python train_model.py
 ```
+The defaults in `config.json` target 12 vCPUs / 24GB RAM. Edit that file to change data paths or hyperparameters; use `python train_model.py --config <path>` to point at another JSON file. Resume a checkpoint with `python train_model.py --resume ckpts/step-XXXXXXX.pt` (uses the same config).
 
 ### Checkpointing and resume
 Checkpoints are saved to `ckpts/step-XXXXXXX.pt` by default and contain model/optimizer/scheduler state plus the config. Resume with `--resume ckpts/step-XXXXXXX.pt`.

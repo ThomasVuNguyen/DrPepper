@@ -1,11 +1,11 @@
-"""Text generation script for checkpoints produced by train.py."""
+"""Text generation script for checkpoints produced by train_model.py."""
 
 from __future__ import annotations
 
 import argparse
 import torch
 
-from train import GPTConfig, GPTSmall, SentencePieceTokenizer, load_checkpoint
+from train_model import GPTConfig, GPTSmall, SentencePieceTokenizer, load_checkpoint
 
 
 def top_k_top_p_filter(logits: torch.Tensor, top_k: int, top_p: float) -> torch.Tensor:

@@ -13,7 +13,8 @@ import json
 import math
 import os
 import random
-from dataclasses import asdict, dataclass
+import time
+from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Iterable, List, Optional, Tuple
 
@@ -98,10 +99,10 @@ class TextDataset(IterableDataset):
 @dataclass
 class GPTConfig:
     vocab_size: int
-    n_layer: int = 8
+    n_layer: int = 3
     n_head: int = 8
-    d_model: int = 512
-    d_ff: int = 2048
+    d_model: int = 256
+    d_ff: int = 1024
     block_size: int = 256
     dropout: float = 0.1
     weight_tie: bool = True
@@ -112,6 +113,52 @@ class GPTConfig:
     @staticmethod
     def from_dict(data: dict) -> "GPTConfig":
         return GPTConfig(**data)
+
+
+@dataclass
+class TrainConfig:
+    data: str
+    tokenizer: str
+    vocab_size: int
+    val_data: Optional[str] = None
+    block_size: int = 256
+    n_layer: int = 8
+    n_head: int = 8
+    d_model: int = 512
+    d_ff: int = 2048
+    dropout: float = 0.1
+    weight_tie: bool = True
+    batch_size: int = 12
+    grad_accum: int = 20
+    lr: float = 3e-4
+    weight_decay: float = 0.1
+    warmup_steps: int = 2000
+    max_steps: int = 100000
+    eval_interval: int = 1000
+    eval_batches: int = 20
+    checkpoint_dir: str = "ckpts"
+    resume: Optional[str] = None
+    num_workers: int = 0
+    seed: int = 42
+    save_interval: int = 1000
+    chunk_bytes: int = 8 * 1024 * 1024
+
+    @staticmethod
+    def from_json(path: str) -> "TrainConfig":
+        with open(path, "r", encoding="utf-8") as fh:
+            raw = json.load(fh)
+
+        allowed = {f.name for f in fields(TrainConfig)}
+        unknown = [k for k in raw.keys() if k not in allowed]
+        if unknown:
+            print(f"[warn] Ignoring unknown config keys: {unknown}")
+        filtered = {k: v for k, v in raw.items() if k in allowed}
+        try:
+            return TrainConfig(**filtered)
+        except TypeError as exc:
+            raise ValueError(
+                f"Invalid config at {path}. Check required fields and types."
+            ) from exc
 
 
 class CausalSelfAttention(nn.Module):
@@ -282,124 +329,136 @@ def cycle(loader: DataLoader) -> Iterable[Tuple[torch.Tensor, torch.Tensor]]:
             yield batch
 
 
+def format_seconds(seconds: float) -> str:
+    seconds = int(max(0, seconds))
+    m, s = divmod(seconds, 60)
+    h, m = divmod(m, 60)
+    if h:
+        return f"{h:d}h{m:02d}m{s:02d}s"
+    if m:
+        return f"{m:d}m{s:02d}s"
+    return f"{s:d}s"
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Train a small GPT model on CPU")
-    p.add_argument("--data", required=True, help="Path to training text file")
     p.add_argument(
-        "--val-data", help="Optional path to validation text file", default=None
+        "--config",
+        type=str,
+        default="config.json",
+        help="Path to JSON config file (defaults to config.json)",
     )
     p.add_argument(
-        "--tokenizer",
-        required=True,
-        help="Path to SentencePiece model (.model)",
+        "--resume",
+        type=str,
+        default=None,
+        help="Optional override for resume checkpoint path",
     )
-    p.add_argument("--vocab-size", type=int, required=True)
-    p.add_argument("--block-size", type=int, default=256)
-    p.add_argument("--n-layer", type=int, default=8)
-    p.add_argument("--n-head", type=int, default=8)
-    p.add_argument("--d-model", type=int, default=512)
-    p.add_argument("--d-ff", type=int, default=2048)
-    p.add_argument("--dropout", type=float, default=0.1)
-    p.add_argument("--batch-size", type=int, default=12)
-    p.add_argument("--grad-accum", type=int, default=20)
-    p.add_argument("--lr", type=float, default=3e-4)
-    p.add_argument("--weight-decay", type=float, default=0.1)
-    p.add_argument("--warmup-steps", type=int, default=2000)
-    p.add_argument("--max-steps", type=int, default=100000)
-    p.add_argument("--eval-interval", type=int, default=1000)
-    p.add_argument("--eval-batches", type=int, default=20)
-    p.add_argument("--checkpoint-dir", type=str, default="ckpts")
-    p.add_argument("--resume", type=str, default=None)
-    p.add_argument("--num-workers", type=int, default=0)
-    p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--save-interval", type=int, default=1000)
-    p.add_argument("--chunk-bytes", type=int, default=8 * 1024 * 1024)
     return p.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    set_seed(args.seed)
+    cfg = TrainConfig.from_json(args.config)
+    if args.resume:
+        cfg.resume = args.resume
+
+    if not Path(cfg.data).is_file():
+        raise FileNotFoundError(
+            f"Training data not found at {cfg.data}. Update the path in {args.config}."
+        )
+    if cfg.val_data and not Path(cfg.val_data).is_file():
+        raise FileNotFoundError(
+            f"Validation data not found at {cfg.val_data}. Update the path in {args.config}."
+        )
+    if not Path(cfg.tokenizer).is_file():
+        raise FileNotFoundError(
+            f"Tokenizer model not found at {cfg.tokenizer}. Update the path in {args.config}."
+        )
+
+    set_seed(cfg.seed)
 
     device = torch.device("cpu")
 
-    tokenizer = SentencePieceTokenizer(args.tokenizer)
-    if tokenizer.vocab_size != args.vocab_size:
+    tokenizer = SentencePieceTokenizer(cfg.tokenizer)
+    if tokenizer.vocab_size != cfg.vocab_size:
         print(
             f"[warn] tokenizer vocab_size={tokenizer.vocab_size} "
-            f"differs from provided --vocab-size={args.vocab_size}. Using tokenizer value."
+            f"differs from provided config vocab_size={cfg.vocab_size}. Using tokenizer value."
         )
     vocab_size = tokenizer.vocab_size
 
     config = GPTConfig(
         vocab_size=vocab_size,
-        n_layer=args.n_layer,
-        n_head=args.n_head,
-        d_model=args.d_model,
-        d_ff=args.d_ff,
-        block_size=args.block_size,
-        dropout=args.dropout,
+        n_layer=cfg.n_layer,
+        n_head=cfg.n_head,
+        d_model=cfg.d_model,
+        d_ff=cfg.d_ff,
+        block_size=cfg.block_size,
+        dropout=cfg.dropout,
+        weight_tie=cfg.weight_tie,
     )
 
     model = GPTSmall(config).to(device)
     optimizer = torch.optim.AdamW(
-        model.parameters(), lr=args.lr, weight_decay=args.weight_decay
+        model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay
     )
     scheduler = torch.optim.lr_scheduler.LambdaLR(
         optimizer,
-        lr_lambda=make_scheduler(args.max_steps, args.warmup_steps),
+        lr_lambda=make_scheduler(cfg.max_steps, cfg.warmup_steps),
     )
 
     start_step = 0
-    if args.resume:
-        checkpoint = load_checkpoint(args.resume)
+    if cfg.resume:
+        checkpoint = load_checkpoint(cfg.resume)
         model.load_state_dict(checkpoint["model_state"])
         optimizer.load_state_dict(checkpoint["optimizer_state"])
         scheduler.load_state_dict(checkpoint["scheduler_state"])
         start_step = checkpoint.get("step", 0)
-        print(f"[info] Resumed from {args.resume} at step {start_step}")
+        print(f"[info] Resumed from {cfg.resume} at step {start_step}")
 
     train_ds = TextDataset(
-        args.data,
+        cfg.data,
         tokenizer=tokenizer,
-        block_size=args.block_size,
-        chunk_bytes=args.chunk_bytes,
+        block_size=cfg.block_size,
+        chunk_bytes=cfg.chunk_bytes,
     )
     train_loader = DataLoader(
         train_ds,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
+        batch_size=cfg.batch_size,
+        num_workers=cfg.num_workers,
         pin_memory=False,
     )
     train_iter = iter(cycle(train_loader))
 
     val_loader = None
-    if args.val_data:
+    if cfg.val_data:
         val_ds = TextDataset(
-            args.val_data,
+            cfg.val_data,
             tokenizer=tokenizer,
-            block_size=args.block_size,
-            chunk_bytes=args.chunk_bytes,
+            block_size=cfg.block_size,
+            chunk_bytes=cfg.chunk_bytes,
         )
         val_loader = DataLoader(
             val_ds,
-            batch_size=args.batch_size,
-            num_workers=args.num_workers,
+            batch_size=cfg.batch_size,
+            num_workers=cfg.num_workers,
         )
 
     scaler = torch.cuda.amp.GradScaler(enabled=False)  # CPU-only
 
     model.train()
-    for step in range(start_step, args.max_steps):
+    loop_start_time = time.time()
+    for step in range(start_step, cfg.max_steps):
         optimizer.zero_grad()
         loss_accum = 0.0
-        for _ in range(args.grad_accum):
+        for _ in range(cfg.grad_accum):
             x, y = next(train_iter)
             x = x.to(device)
             y = y.to(device)
             with torch.autocast(device_type="cpu", dtype=torch.bfloat16, enabled=False):
                 _, loss = model(x, y)
-            loss = loss / args.grad_accum
+            loss = loss / cfg.grad_accum
             loss.backward()
             loss_accum += loss.item()
 
@@ -409,17 +468,23 @@ def main() -> None:
 
         if (step + 1) % 10 == 0 or step == start_step:
             lr = scheduler.get_last_lr()[0]
+            steps_done = step - start_step + 1
+            elapsed = time.time() - loop_start_time
+            avg_time_per_step = elapsed / max(1, steps_done)
+            remaining_steps = cfg.max_steps - (step + 1)
+            eta = remaining_steps * avg_time_per_step
             print(
-                f"step {step+1}/{args.max_steps} | loss {loss_accum:.4f} | lr {lr:.6f}"
+                f"step {step+1}/{cfg.max_steps} | loss {loss_accum:.4f} | lr {lr:.6f} "
+                f"| avg_step {avg_time_per_step:.2f}s | eta {format_seconds(eta)}"
             )
 
-        if val_loader and (step + 1) % args.eval_interval == 0:
-            val_loss = evaluate(model, val_loader, device, args.eval_batches)
+        if val_loader and (step + 1) % cfg.eval_interval == 0:
+            val_loss = evaluate(model, val_loader, device, cfg.eval_batches)
             print(f"[eval] step {step+1}: val_loss={val_loss:.4f}")
 
-        if (step + 1) % args.save_interval == 0 or (step + 1) == args.max_steps:
+        if (step + 1) % cfg.save_interval == 0 or (step + 1) == cfg.max_steps:
             ckpt_path = (
-                Path(args.checkpoint_dir)
+                Path(cfg.checkpoint_dir)
                 / f"step-{step+1:07d}.pt"
             )
             save_checkpoint(
@@ -429,7 +494,7 @@ def main() -> None:
                 scheduler,
                 step=step + 1,
                 config=config,
-                extra={"tokenizer_path": args.tokenizer},
+                extra={"tokenizer_path": cfg.tokenizer},
             )
             print(f"[ckpt] saved to {ckpt_path}")
 
